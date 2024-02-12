@@ -22,6 +22,7 @@ import { DirectionAttribute, DirectionStyle } from '../formats/direction';
 import { FontStyle } from '../formats/font';
 import { SizeStyle } from '../formats/size';
 import { deleteRange } from './keyboard';
+import normalizeExternalHTML from './normalizeExternalHTML';
 
 const debug = logger('quill:clipboard');
 
@@ -40,9 +41,9 @@ const CLIPBOARD_CONFIG: [Selector, Matcher][] = [
   ['ol, ul', matchList],
   ['pre', matchCodeBlock],
   ['tr', matchTable],
-  ['b', matchAlias.bind(matchAlias, 'bold')],
-  ['i', matchAlias.bind(matchAlias, 'italic')],
-  ['strike', matchAlias.bind(matchAlias, 'strike')],
+  ['b', createMatchAlias('bold')],
+  ['i', createMatchAlias('italic')],
+  ['strike', createMatchAlias('strike')],
   ['style', matchIgnore],
 ];
 
@@ -105,7 +106,7 @@ class Clipboard extends Module<ClipboardOptions> {
       });
     }
     if (!html) {
-      return new Delta().insert(text || '');
+      return new Delta().insert(text || '', formats);
     }
     const delta = this.convertHTML(html);
     // Remove trailing newline
@@ -118,8 +119,13 @@ class Clipboard extends Module<ClipboardOptions> {
     return delta;
   }
 
-  convertHTML(html: string) {
+  protected normalizeHTML(doc: Document) {
+    normalizeExternalHTML(doc);
+  }
+
+  protected convertHTML(html: string) {
     const doc = new DOMParser().parseFromString(html, 'text/html');
+    this.normalizeHTML(doc);
     const container = doc.body;
     const nodeMatches = new WeakMap();
     const [elementMatchers, textMatchers] = this.prepareMatching(
@@ -254,18 +260,16 @@ Clipboard.DEFAULTS = {
   matchers: [],
 };
 
-function applyFormat(delta: Delta, formats: Record<string, unknown>): Delta;
-function applyFormat(delta: Delta, format: string, value: unknown): Delta;
 function applyFormat(
   delta: Delta,
-  format: string | Record<string, unknown>,
-  value?: unknown,
+  format: string,
+  value: unknown,
+  scroll: ScrollBlot,
 ): Delta {
-  if (typeof format === 'object') {
-    return Object.keys(format).reduce((newDelta, key) => {
-      return applyFormat(newDelta, key, format[key]);
-    }, delta);
+  if (!scroll.query(format)) {
+    return delta;
   }
+
   return delta.reduce((newDelta, op) => {
     if (op.attributes && op.attributes[format]) {
       return newDelta.push(op);
@@ -290,8 +294,12 @@ function deltaEndsWith(delta: Delta, text: string) {
   return endText.slice(-1 * text.length) === text;
 }
 
-function isLine(node: Element) {
-  if (node.childNodes.length === 0) return false; // Exclude embed blocks
+function isLine(node: Node, scroll: ScrollBlot) {
+  if (!(node instanceof Element)) return false;
+  const match = scroll.query(node);
+  // @ts-expect-error
+  if (match && match.prototype instanceof EmbedBlot) return false;
+
   return [
     'address',
     'article',
@@ -328,6 +336,15 @@ function isLine(node: Element) {
     'ul',
     'video',
   ].includes(node.tagName.toLowerCase());
+}
+
+function isBetweenInlineElements(node: HTMLElement, scroll: ScrollBlot) {
+  return (
+    node.previousElementSibling &&
+    node.nextElementSibling &&
+    !isLine(node.previousElementSibling, scroll) &&
+    !isLine(node.nextElementSibling, scroll)
+  );
 }
 
 const preNodes = new WeakMap();
@@ -383,8 +400,10 @@ function traverse(
   return new Delta();
 }
 
-function matchAlias(format: string, node: Element, delta: Delta) {
-  return applyFormat(delta, format, true);
+function createMatchAlias(format: string) {
+  return (_node: Element, delta: Delta, scroll: ScrollBlot) => {
+    return applyFormat(delta, format, true, scroll);
+  };
 }
 
 function matchAttributor(node: HTMLElement, delta: Delta, scroll: ScrollBlot) {
@@ -411,10 +430,11 @@ function matchAttributor(node: HTMLElement, delta: Delta, scroll: ScrollBlot) {
         formats[attr.attrName] = attr.value(node) || undefined;
       }
     });
-  if (Object.keys(formats).length > 0) {
-    return applyFormat(delta, formats);
-  }
-  return delta;
+
+  return Object.entries(formats).reduce(
+    (newDelta, [name, value]) => applyFormat(newDelta, name, value, scroll),
+    delta,
+  );
 }
 
 function matchBlot(node: Node, delta: Delta, scroll: ScrollBlot) {
@@ -436,10 +456,17 @@ function matchBlot(node: Node, delta: Delta, scroll: ScrollBlot) {
     if (match.prototype instanceof BlockBlot && !deltaEndsWith(delta, '\n')) {
       delta.insert('\n');
     }
-    // @ts-expect-error
-    if (typeof match.formats === 'function') {
-      // @ts-expect-error
-      return applyFormat(delta, match.blotName, match.formats(node, scroll));
+    if (
+      'blotName' in match &&
+      'formats' in match &&
+      typeof match.formats === 'function'
+    ) {
+      return applyFormat(
+        delta,
+        match.blotName,
+        match.formats(node, scroll),
+        scroll,
+      );
     }
   }
   return delta;
@@ -454,9 +481,11 @@ function matchBreak(node: Node, delta: Delta) {
 
 function matchCodeBlock(node: Node, delta: Delta, scroll: ScrollBlot) {
   const match = scroll.query('code-block');
-  // @ts-expect-error
-  const language = match ? match.formats(node, scroll) : true;
-  return applyFormat(delta, 'code-block', language);
+  const language =
+    match && 'formats' in match && typeof match.formats === 'function'
+      ? match.formats(node, scroll)
+      : true;
+  return applyFormat(delta, 'code-block', language, scroll);
 }
 
 function matchIgnore() {
@@ -492,23 +521,21 @@ function matchIndent(node: Node, delta: Delta, scroll: ScrollBlot) {
   }, new Delta());
 }
 
-function matchList(node: Node, delta: Delta) {
+function matchList(node: Node, delta: Delta, scroll: ScrollBlot) {
   // @ts-expect-error
   const list = node.tagName === 'OL' ? 'ordered' : 'bullet';
-  return applyFormat(delta, 'list', list);
+  return applyFormat(delta, 'list', list, scroll);
 }
 
 function matchNewline(node: Node, delta: Delta, scroll: ScrollBlot) {
   if (!deltaEndsWith(delta, '\n')) {
-    // @ts-expect-error
-    if (isLine(node)) {
+    if (isLine(node, scroll)) {
       return delta.insert('\n');
     }
     if (delta.length() > 0 && node.nextSibling) {
       let nextSibling: Node | null = node.nextSibling;
       while (nextSibling != null) {
-        // @ts-expect-error
-        if (isLine(nextSibling)) {
+        if (isLine(nextSibling, scroll)) {
           return delta.insert('\n');
         }
         const match = scroll.query(nextSibling);
@@ -523,7 +550,7 @@ function matchNewline(node: Node, delta: Delta, scroll: ScrollBlot) {
   return delta;
 }
 
-function matchStyles(node: HTMLElement, delta: Delta) {
+function matchStyles(node: HTMLElement, delta: Delta, scroll: ScrollBlot) {
   const formats: Record<string, unknown> = {};
   const style: Partial<CSSStyleDeclaration> = node.style || {};
   if (style.fontStyle === 'italic') {
@@ -542,9 +569,10 @@ function matchStyles(node: HTMLElement, delta: Delta) {
   ) {
     formats.bold = true;
   }
-  if (Object.keys(formats).length > 0) {
-    delta = applyFormat(delta, formats);
-  }
+  delta = Object.entries(formats).reduce(
+    (newDelta, [name, value]) => applyFormat(newDelta, name, value, scroll),
+    delta,
+  );
   // @ts-expect-error
   if (parseFloat(style.textIndent || 0) > 0) {
     // Could be 0.5in
@@ -553,7 +581,11 @@ function matchStyles(node: HTMLElement, delta: Delta) {
   return delta;
 }
 
-function matchTable(node: HTMLTableRowElement, delta: Delta) {
+function matchTable(
+  node: HTMLTableRowElement,
+  delta: Delta,
+  scroll: ScrollBlot,
+) {
   const table =
     node.parentElement?.tagName === 'TABLE'
       ? node.parentElement
@@ -561,11 +593,12 @@ function matchTable(node: HTMLTableRowElement, delta: Delta) {
   if (table != null) {
     const rows = Array.from(table.querySelectorAll('tr'));
     const row = rows.indexOf(node) + 1;
-    return applyFormat(delta, 'table', row);
+    return applyFormat(delta, 'table', row, scroll);
   }
+  return delta;
 }
 
-function matchText(node: HTMLElement, delta: Delta) {
+function matchText(node: HTMLElement, delta: Delta, scroll: ScrollBlot) {
   // @ts-expect-error
   let text = node.data;
   // Word represents empty line with <o:p>&nbsp;</o:p>
@@ -573,7 +606,11 @@ function matchText(node: HTMLElement, delta: Delta) {
     return delta.insert(text.trim());
   }
   if (!isPre(node)) {
-    if (text.trim().length === 0 && text.includes('\n')) {
+    if (
+      text.trim().length === 0 &&
+      text.includes('\n') &&
+      !isBetweenInlineElements(node, scroll)
+    ) {
       return delta;
     }
     const replacer = (collapse: unknown, match: string) => {
@@ -585,16 +622,17 @@ function matchText(node: HTMLElement, delta: Delta) {
     if (
       (node.previousSibling == null &&
         node.parentElement != null &&
-        isLine(node.parentElement)) ||
-      (node.previousSibling instanceof Element && isLine(node.previousSibling))
+        isLine(node.parentElement, scroll)) ||
+      (node.previousSibling instanceof Element &&
+        isLine(node.previousSibling, scroll))
     ) {
       text = text.replace(/^\s+/, replacer.bind(replacer, false));
     }
     if (
       (node.nextSibling == null &&
         node.parentElement != null &&
-        isLine(node.parentElement)) ||
-      (node.nextSibling instanceof Element && isLine(node.nextSibling))
+        isLine(node.parentElement, scroll)) ||
+      (node.nextSibling instanceof Element && isLine(node.nextSibling, scroll))
     ) {
       text = text.replace(/\s+$/, replacer.bind(replacer, false));
     }

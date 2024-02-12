@@ -6,6 +6,7 @@ const items = [
       'getContents',
       'getLength',
       'getText',
+      'getSemanticHTML',
       'insertEmbed',
       'insertText',
       'setContents',
@@ -19,11 +20,24 @@ const items = [
   },
   {
     title: 'Selection',
-    hashes: ['getBounds', 'getSelection', 'setSelection'],
+    hashes: [
+      'getBounds',
+      'getSelection',
+      'setSelection',
+      'scrollSelectionIntoView',
+    ],
   },
   {
     title: 'Editor',
-    hashes: ['blur', 'focus', 'disable', 'enable', 'hasFocus', 'update'],
+    hashes: [
+      'blur',
+      'focus',
+      'disable',
+      'enable',
+      'hasFocus',
+      'update',
+      'scrollRectIntoView-experimental',
+    ],
   },
   {
     title: 'Events',
@@ -38,13 +52,7 @@ const items = [
   },
   {
     title: 'Model',
-    hashes: [
-      'find-experimental',
-      'getIndex-experimental',
-      'getLeaf-experimental',
-      'getLine-experimental',
-      'getLines-experimental',
-    ],
+    hashes: ['find', 'getIndex', 'getLeaf', 'getLine', 'getLines'],
   },
   {
     title: 'Extension',
